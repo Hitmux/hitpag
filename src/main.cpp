@@ -3,12 +3,24 @@
 #include <vector>
 #include <map>
 #include <filesystem>
-#include <cstdlib>
+#include <cstdlib> // For system, WEXITSTATUS
 #include <memory>
 #include <stdexcept>
 #include <array>
 #include <fstream>
-#include <algorithm> // For std::tolower
+#include <algorithm> // For std::transform, std::min
+#include <cctype>    // For std::tolower, isalpha
+
+#ifdef _WIN32
+#include <process.h> // For _pclose, _popen on Windows
+#define POPEN _popen
+#define PCLOSE _pclose
+#else
+#include <cstdio> // For popen, pclose
+#define POPEN popen
+#define PCLOSE pclose
+#endif
+
 
 namespace fs = std::filesystem;
 
@@ -33,14 +45,14 @@ namespace i18n {
         {"help_example3", "  hitpag -i big_file.rar .              # Interactive decompression of big_file.rar to current directory"},
         
         // Error messages
-        {"error_missing_args", "Error: Missing arguments"},
-        {"error_invalid_source", "Error: Source path does not exist"},
-        {"error_invalid_target", "Error: Invalid target path"},
+        {"error_missing_args", "Error: Missing arguments. {ADDITIONAL_INFO}"},
+        {"error_invalid_source", "Error: Source path '{PATH}' does not exist or is invalid. {REASON}"},
+        {"error_invalid_target", "Error: Invalid target path '{PATH}'. {REASON}"},
         {"error_same_path", "Error: Source and target paths cannot be the same"},
-        {"error_unknown_format", "Error: Unrecognized file format"},
-        {"error_tool_not_found", "Error: Required tool not found: "},
-        {"error_operation_failed", "Error: Operation failed: "},
-        {"error_permission_denied", "Error: Permission denied"},
+        {"error_unknown_format", "Error: Unrecognized file format or ambiguous operation. {INFO}"},
+        {"error_tool_not_found", "Error: Required tool not found: {TOOL_NAME}. Please ensure it is installed and in your system's PATH."},
+        {"error_operation_failed", "Error: Operation failed (command: {COMMAND}, exit code: {EXIT_CODE})."},
+        {"error_permission_denied", "Error: Permission denied. {PATH}"},
         {"error_not_enough_space", "Error: Not enough disk space"},
         
         // Interactive mode messages
@@ -55,9 +67,9 @@ namespace i18n {
         {"format_tar_xz", "4. tar.xz (xz compression)"},
         {"format_zip", "5. zip"},
         {"format_7z", "6. 7z"},
-        {"format_rar", "7. rar"},
-        {"ask_overwrite", "Target already exists, overwrite? (y/n): "},
-        {"ask_delete_source", "Delete source file after operation? (y/n): "},
+        {"format_rar", "7. rar (decompression only recommended for interactive mode)"}, // Adjusted
+        {"ask_overwrite", "Target '{TARGET_PATH}' already exists, overwrite? (y/n): "},
+        {"ask_delete_source", "Delete source '{SOURCE_PATH}' after operation? (y/n): "},
         {"invalid_choice", "Invalid choice, please try again"},
         
         // Operation messages
@@ -68,33 +80,57 @@ namespace i18n {
         
         // Progress display
         {"progress", "Progress: "},
-        {"remaining_time", "Estimated remaining time: "},
+        {"remaining_time", "Estimated remaining time: "}, // Placeholder, not implemented
         {"processing_file", "Processing: "}
     };
     
     // Get message text
-    std::string get(const std::string& key) {
+    std::string get(const std::string& key, const std::map<std::string, std::string>& placeholders = {}) {
         auto it = messages.find(key);
+        std::string message_template;
         if (it != messages.end()) {
-            return it->second;
+            message_template = it->second;
+        } else {
+            return "[" + key + "]"; // Return key itself if not found
         }
-        return "[" + key + "]";
+
+        for(const auto& p : placeholders) {
+            std::string placeholder_key = "{" + p.first + "}";
+            size_t pos = message_template.find(placeholder_key);
+            while(pos != std::string::npos) {
+                message_template.replace(pos, placeholder_key.length(), p.second);
+                pos = message_template.find(placeholder_key, pos + p.second.length());
+            }
+        }
+        // Remove unused placeholders
+        size_t start_ph = message_template.find("{");
+        while(start_ph != std::string::npos) {
+            size_t end_ph = message_template.find("}", start_ph);
+            if (end_ph != std::string::npos) {
+                message_template.replace(start_ph, end_ph - start_ph + 1, "");
+            } else {
+                break; // No closing brace
+            }
+            start_ph = message_template.find("{");
+        }
+        return message_template;
     }
 }
 
 // Error handling module
 namespace error {
     enum class ErrorCode {
-        SUCCESS,
-        MISSING_ARGS,
-        INVALID_SOURCE,
-        INVALID_TARGET,
-        SAME_PATH,
-        UNKNOWN_FORMAT,
-        TOOL_NOT_FOUND,
-        OPERATION_FAILED,
-        PERMISSION_DENIED,
-        NOT_ENOUGH_SPACE
+        SUCCESS = 0,
+        MISSING_ARGS = 1,
+        INVALID_SOURCE = 2,
+        INVALID_TARGET = 3,
+        SAME_PATH = 4,
+        UNKNOWN_FORMAT = 5,
+        TOOL_NOT_FOUND = 6,
+        OPERATION_FAILED = 7,
+        PERMISSION_DENIED = 8,
+        NOT_ENOUGH_SPACE = 9,
+        UNKNOWN_ERROR = 99
     };
     
     class HitpagException : public std::runtime_error {
@@ -108,42 +144,23 @@ namespace error {
         ErrorCode code() const { return code_; }
     };
     
-    void throw_error(ErrorCode code, const std::string& additional_info = "") {
-        std::string message;
+    void throw_error(ErrorCode code, const std::map<std::string, std::string>& placeholders = {}) {
+        std::string message_key;
         
         switch (code) {
-            case ErrorCode::MISSING_ARGS:
-                message = i18n::get("error_missing_args");
-                break;
-            case ErrorCode::INVALID_SOURCE:
-                message = i18n::get("error_invalid_source");
-                break;
-            case ErrorCode::INVALID_TARGET:
-                message = i18n::get("error_invalid_target");
-                break;
-            case ErrorCode::SAME_PATH:
-                message = i18n::get("error_same_path");
-                break;
-            case ErrorCode::UNKNOWN_FORMAT:
-                message = i18n::get("error_unknown_format");
-                break;
-            case ErrorCode::TOOL_NOT_FOUND:
-                message = i18n::get("error_tool_not_found") + additional_info;
-                break;
-            case ErrorCode::OPERATION_FAILED:
-                message = i18n::get("error_operation_failed") + additional_info;
-                break;
-            case ErrorCode::PERMISSION_DENIED:
-                message = i18n::get("error_permission_denied");
-                break;
-            case ErrorCode::NOT_ENOUGH_SPACE:
-                message = i18n::get("error_not_enough_space");
-                break;
-            default:
-                message = "Unknown error";
+            case ErrorCode::MISSING_ARGS: message_key = "error_missing_args"; break;
+            case ErrorCode::INVALID_SOURCE: message_key = "error_invalid_source"; break;
+            case ErrorCode::INVALID_TARGET: message_key = "error_invalid_target"; break;
+            case ErrorCode::SAME_PATH: message_key = "error_same_path"; break;
+            case ErrorCode::UNKNOWN_FORMAT: message_key = "error_unknown_format"; break;
+            case ErrorCode::TOOL_NOT_FOUND: message_key = "error_tool_not_found"; break;
+            case ErrorCode::OPERATION_FAILED: message_key = "error_operation_failed"; break;
+            case ErrorCode::PERMISSION_DENIED: message_key = "error_permission_denied"; break;
+            case ErrorCode::NOT_ENOUGH_SPACE: message_key = "error_not_enough_space"; break;
+            default: message_key = "Unknown error"; code = ErrorCode::UNKNOWN_ERROR;
         }
         
-        throw HitpagException(code, message);
+        throw HitpagException(code, i18n::get(message_key, placeholders));
     }
 }
 
@@ -160,45 +177,51 @@ namespace args {
     Options parse(int argc, char* argv[]) {
         Options options;
         
-        // If no arguments, show help
-        if (argc < 2) {
+        if (argc < 2) { 
             options.show_help = true;
             return options;
         }
         
-        std::vector<std::string> args;
+        std::vector<std::string> args_vec;
         for (int i = 1; i < argc; ++i) {
-            args.push_back(argv[i]);
+            args_vec.push_back(argv[i]);
         }
         
-        // Parse options
-        size_t i = 0;
-        while (i < args.size() && args[i][0] == '-') {
-            if (args[i] == "-i") {
+        size_t current_arg_idx = 0;
+        while (current_arg_idx < args_vec.size() && !args_vec[current_arg_idx].empty() && args_vec[current_arg_idx][0] == '-') {
+            const std::string& opt = args_vec[current_arg_idx];
+            if (opt == "-i") {
                 options.interactive_mode = true;
-            } else if (args[i] == "-h" || args[i] == "--help") {
+            } else if (opt == "-h" || opt == "--help") {
                 options.show_help = true;
-                return options;
-            } else if (args[i] == "-v" || args[i] == "--version") {
+                return options; 
+            } else if (opt == "-v" || opt == "--version") {
                 options.show_version = true;
-                return options;
+                return options; 
             } else {
-                error::throw_error(error::ErrorCode::MISSING_ARGS);
+                 error::throw_error(error::ErrorCode::MISSING_ARGS, {{"ADDITIONAL_INFO", "Unknown option: " + opt}});
             }
-            ++i;
+            current_arg_idx++;
         }
         
-        // Parse path arguments
-        if (i < args.size()) {
-            options.source_path = args[i++];
+        if (current_arg_idx < args_vec.size()) {
+            options.source_path = args_vec[current_arg_idx++];
         } else {
-            error::throw_error(error::ErrorCode::MISSING_ARGS);
+            if (!options.interactive_mode && !options.show_help && !options.show_version) {
+                 error::throw_error(error::ErrorCode::MISSING_ARGS, {{"ADDITIONAL_INFO", "Source path missing"}});
+            }
         }
         
-        if (i < args.size()) {
-            options.target_path = args[i++];
-        } else if (!options.interactive_mode) {
-            error::throw_error(error::ErrorCode::MISSING_ARGS);
+        if (current_arg_idx < args_vec.size()) {
+            options.target_path = args_vec[current_arg_idx++];
+        } else {
+            if (!options.interactive_mode && !options.show_help && !options.show_version && !options.source_path.empty()) {
+                 error::throw_error(error::ErrorCode::MISSING_ARGS, {{"ADDITIONAL_INFO", "Target path missing"}});
+            }
+        }
+
+        if (current_arg_idx < args_vec.size()) {
+            error::throw_error(error::ErrorCode::MISSING_ARGS, {{"ADDITIONAL_INFO", "Too many arguments"}});
         }
         
         return options;
@@ -248,207 +271,123 @@ namespace file_type {
     
     struct RecognitionResult {
         FileType source_type = FileType::UNKNOWN;
-        FileType target_type = FileType::UNKNOWN;
+        FileType target_type_hint = FileType::UNKNOWN; 
         OperationType operation = OperationType::UNKNOWN;
     };
     
-    // Recognize file type by extension
-    FileType recognize_by_extension(const std::string& path) {
-        std::string ext = fs::path(path).extension().string();
-        std::string stem_ext = fs::path(fs::path(path).stem()).extension().string();
-        
-        // Convert to lowercase
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        std::transform(stem_ext.begin(), stem_ext.end(), stem_ext.begin(), ::tolower);
-        
-        if (ext == ".gz" && stem_ext == ".tar") return FileType::ARCHIVE_TAR_GZ;
-        if (ext == ".tgz") return FileType::ARCHIVE_TAR_GZ;
-        if (ext == ".bz2" && stem_ext == ".tar") return FileType::ARCHIVE_TAR_BZ2;
-        if (ext == ".tbz2") return FileType::ARCHIVE_TAR_BZ2;
-        if (ext == ".xz" && stem_ext == ".tar") return FileType::ARCHIVE_TAR_XZ;
-        if (ext == ".txz") return FileType::ARCHIVE_TAR_XZ;
+    FileType recognize_by_extension(const std::string& path_str) {
+        fs::path p(path_str);
+        if (!p.has_extension()) return FileType::UNKNOWN;
+
+        std::string ext = p.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c){ return std::tolower(c); });
+
+
         if (ext == ".tar") return FileType::ARCHIVE_TAR;
         if (ext == ".zip") return FileType::ARCHIVE_ZIP;
         if (ext == ".rar") return FileType::ARCHIVE_RAR;
         if (ext == ".7z") return FileType::ARCHIVE_7Z;
+
+        if (p.has_stem() && fs::path(p.stem()).has_extension()) {
+            std::string stem_ext_str = fs::path(p.stem()).extension().string();
+             std::transform(stem_ext_str.begin(), stem_ext_str.end(), stem_ext_str.begin(), [](unsigned char c){ return std::tolower(c); });
+
+            if (stem_ext_str == ".tar") {
+                if (ext == ".gz") return FileType::ARCHIVE_TAR_GZ;
+                if (ext == ".bz2") return FileType::ARCHIVE_TAR_BZ2;
+                if (ext == ".xz") return FileType::ARCHIVE_TAR_XZ;
+            }
+        }
+        if (ext == ".tgz") return FileType::ARCHIVE_TAR_GZ;
+        if (ext == ".tbz2" || ext == ".tbz") return FileType::ARCHIVE_TAR_BZ2;
+        if (ext == ".txz") return FileType::ARCHIVE_TAR_XZ;
         
         return FileType::UNKNOWN;
     }
-    
-    // Recognize file type by header information
+        
     FileType recognize_by_header(const std::string& path) {
-        // Open file
         std::ifstream file(path, std::ios::binary);
-        if (!file) {
-            return FileType::UNKNOWN;
-        }
+        if (!file) return FileType::UNKNOWN;
         
-        // Read file header
-        std::array<char, 8> header;
+        std::array<char, 8> header{}; 
         file.read(header.data(), header.size());
-        
-        // Check file header signatures
-        if (header[0] == 0x50 && header[1] == 0x4B) {
-            return FileType::ARCHIVE_ZIP;  // ZIP: PK
-        }
-        if (header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72) {
-            return FileType::ARCHIVE_RAR;  // RAR: Rar!
-        }
-        if (header[0] == 0x37 && header[1] == 0x7A && header[2] == 0xBC && header[3] == 0xAF) {
-            return FileType::ARCHIVE_7Z;   // 7Z: 7z¼¯
-        }
-        if (header[0] == 0x1F && header[1] == 0x8B) {
-            return FileType::ARCHIVE_TAR_GZ;  // GZIP: 1F 8B
-        }
-        if (header[0] == 0x42 && header[1] == 0x5A && header[2] == 0x68) {
-            return FileType::ARCHIVE_TAR_BZ2;  // BZIP2: BZh
-        }
-        if (header[0] == 0xFD && header[1] == 0x37 && header[2] == 0x7A && header[3] == 0x58) {
-            return FileType::ARCHIVE_TAR_XZ;  // XZ: FD 37 7A 58
-        }
-        
-        // Check for TAR file (TAR header has "ustar" at offset 257)
+        if(file.gcount() < 4) return FileType::UNKNOWN; 
+
+        if (header[0] == 0x50 && header[1] == 0x4B) return FileType::ARCHIVE_ZIP;
+        if (header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21) return FileType::ARCHIVE_RAR; 
+        if (header[0] == 0x37 && header[1] == 0x7A && header[2] == (char)0xBC && header[3] == (char)0xAF) return FileType::ARCHIVE_7Z;
+        if (header[0] == (char)0x1F && header[1] == (char)0x8B) return FileType::ARCHIVE_TAR_GZ; 
+        if (header[0] == 0x42 && header[1] == 0x5A && header[2] == 0x68) return FileType::ARCHIVE_TAR_BZ2; 
+        if (header[0] == (char)0xFD && header[1] == 0x37 && header[2] == 0x7A && header[3] == 0x58 && file.gcount() >= 6 && header[4] == 0x5A && header[5] == 0x00) return FileType::ARCHIVE_TAR_XZ; 
+
+        file.clear(); 
         file.seekg(257);
-        std::array<char, 5> tar_header;
+        std::array<char, 6> tar_header{}; 
         file.read(tar_header.data(), tar_header.size());
-        if (std::string(tar_header.data(), 5) == "ustar") {
+        if (file.gcount() >= 5 && std::string(tar_header.data(), 5) == "ustar") {
             return FileType::ARCHIVE_TAR;
         }
         
         return FileType::UNKNOWN;
     }
     
-    // Recognize file type and operation type
-    RecognitionResult recognize(const std::string& source_path, const std::string& target_path) {
+    RecognitionResult recognize(const std::string& source_path_str, const std::string& target_path_str) {
         RecognitionResult result;
-        
-        // Check if source path exists
-        if (!fs::exists(source_path)) {
-            error::throw_error(error::ErrorCode::INVALID_SOURCE);
+        fs::path source_p(source_path_str);
+
+        if (!fs::exists(source_p)) {
+            error::throw_error(error::ErrorCode::INVALID_SOURCE, {{"PATH", source_path_str}});
         }
         
-        // Recognize source path type
-        if (fs::is_directory(source_path)) {
+        if (fs::is_directory(source_p)) {
             result.source_type = FileType::DIRECTORY;
-        } else if (fs::is_regular_file(source_path)) {
-            // First try to recognize by extension
-            result.source_type = recognize_by_extension(source_path);
-            
-            // If not recognized by extension, try to recognize by file header
+        } else if (fs::is_regular_file(source_p)) {
+            result.source_type = recognize_by_extension(source_path_str);
             if (result.source_type == FileType::UNKNOWN) {
-                result.source_type = recognize_by_header(source_path);
+                result.source_type = recognize_by_header(source_path_str);
             }
-            
-            // Debug output
-            std::string type_str;
-            switch (result.source_type) {
-                case FileType::REGULAR_FILE: type_str = "Regular File"; break;
-                case FileType::DIRECTORY: type_str = "Directory"; break;
-                case FileType::ARCHIVE_TAR: type_str = "TAR Archive"; break;
-                case FileType::ARCHIVE_TAR_GZ: type_str = "TAR.GZ Archive"; break;
-                case FileType::ARCHIVE_TAR_BZ2: type_str = "TAR.BZ2 Archive"; break;
-                case FileType::ARCHIVE_TAR_XZ: type_str = "TAR.XZ Archive"; break;
-                case FileType::ARCHIVE_ZIP: type_str = "ZIP Archive"; break;
-                case FileType::ARCHIVE_RAR: type_str = "RAR Archive"; break;
-                case FileType::ARCHIVE_7Z: type_str = "7Z Archive"; break;
-                default: type_str = "Unknown Type"; break;
-            }
-            std::cout << "DEBUG: Source file type recognition result: " << type_str << std::endl;
-            
-            // If still unrecognized, treat as regular file
             if (result.source_type == FileType::UNKNOWN) {
-                result.source_type = FileType::REGULAR_FILE;
+                result.source_type = FileType::REGULAR_FILE; 
             }
         } else {
-            error::throw_error(error::ErrorCode::INVALID_SOURCE);
+            error::throw_error(error::ErrorCode::INVALID_SOURCE, {{"PATH", source_path_str}, {"REASON", "not a regular file or directory"}});
         }
-        
-        // Recognize target path type
-        if (target_path.empty()) {
-            result.target_type = FileType::UNKNOWN;
-        } else if (fs::exists(target_path)) {
-            if (fs::is_directory(target_path)) {
-                result.target_type = FileType::DIRECTORY;
-            } else if (fs::is_regular_file(target_path)) {
-                result.target_type = FileType::REGULAR_FILE;
-            } else {
-                error::throw_error(error::ErrorCode::INVALID_TARGET);
-            }
-        } else {
-            // Target path does not exist, determine by extension
-            result.target_type = recognize_by_extension(target_path);
-            
-            // If not recognized by extension, determine if it's a directory based on trailing slash
-            if (result.target_type == FileType::UNKNOWN) {
-                if (!target_path.empty() && (target_path.back() == '/' || target_path.back() == '\\')) {
-                    result.target_type = FileType::DIRECTORY;
-                } else {
-                    // If source is an archive and target is unrecognized, default target to directory (decompression target)
-                    if (result.source_type == FileType::ARCHIVE_TAR ||
-                        result.source_type == FileType::ARCHIVE_TAR_GZ ||
-                        result.source_type == FileType::ARCHIVE_TAR_BZ2 ||
-                        result.source_type == FileType::ARCHIVE_TAR_XZ ||
-                        result.source_type == FileType::ARCHIVE_ZIP ||
-                        result.source_type == FileType::ARCHIVE_RAR ||
-                        result.source_type == FileType::ARCHIVE_7Z) {
-                        result.target_type = FileType::DIRECTORY;
-                    } else {
-                        result.target_type = FileType::REGULAR_FILE;
-                    }
-                }
-            }
+
+        bool target_is_archive_extension = false;
+        if (!target_path_str.empty()) {
+            result.target_type_hint = recognize_by_extension(target_path_str);
+            target_is_archive_extension = (result.target_type_hint != FileType::UNKNOWN && 
+                                           result.target_type_hint != FileType::REGULAR_FILE && 
+                                           result.target_type_hint != FileType::DIRECTORY);
         }
-        
-        // Debug output
-        std::string target_type_str;
-        switch (result.target_type) {
-            case FileType::REGULAR_FILE: target_type_str = "Regular File"; break;
-            case FileType::DIRECTORY: target_type_str = "Directory"; break;
-            case FileType::ARCHIVE_TAR: target_type_str = "TAR Archive"; break;
-            case FileType::ARCHIVE_TAR_GZ: target_type_str = "TAR.GZ Archive"; break;
-            case FileType::ARCHIVE_TAR_BZ2: target_type_str = "TAR.BZ2 Archive"; break;
-            case FileType::ARCHIVE_TAR_XZ: target_type_str = "TAR.XZ Archive"; break;
-            case FileType::ARCHIVE_ZIP: target_type_str = "ZIP Archive"; break;
-            case FileType::ARCHIVE_RAR: target_type_str = "RAR Archive"; break;
-            case FileType::ARCHIVE_7Z: target_type_str = "7Z Archive"; break;
-            default: target_type_str = "Unknown Type"; break;
-        }
-        std::cout << "DEBUG: Target path type recognition result: " << target_type_str << std::endl;
-        
-        // Determine operation type
+
         if (result.source_type == FileType::DIRECTORY || result.source_type == FileType::REGULAR_FILE) {
-            // Source is a directory or regular file, target is an archive, perform compression
-            if (result.target_type == FileType::ARCHIVE_TAR ||
-                result.target_type == FileType::ARCHIVE_TAR_GZ ||
-                result.target_type == FileType::ARCHIVE_TAR_BZ2 ||
-                result.target_type == FileType::ARCHIVE_TAR_XZ ||
-                result.target_type == FileType::ARCHIVE_ZIP ||
-                result.target_type == FileType::ARCHIVE_RAR ||
-                result.target_type == FileType::ARCHIVE_7Z) {
+            if (target_is_archive_extension) {
                 result.operation = OperationType::COMPRESS;
+            } else if (!target_path_str.empty() && fs::exists(target_path_str) && fs::is_directory(target_path_str)) {
+                 error::throw_error(error::ErrorCode::UNKNOWN_FORMAT, {{"INFO", "Cannot compress into an existing directory without specifying an archive name. Target for compression must be an archive file name."}});
+            } else if (!target_path_str.empty()) { 
+                error::throw_error(error::ErrorCode::UNKNOWN_FORMAT, {{"INFO", "Target for compression must have a recognized archive extension."}});
+            } else {
+                 error::throw_error(error::ErrorCode::MISSING_ARGS, {{"ADDITIONAL_INFO", "Target path required for compression."}});
             }
-        } else if (result.source_type == FileType::ARCHIVE_TAR ||
-                   result.source_type == FileType::ARCHIVE_TAR_GZ ||
-                   result.source_type == FileType::ARCHIVE_TAR_BZ2 ||
-                   result.source_type == FileType::ARCHIVE_TAR_XZ ||
-                   result.source_type == FileType::ARCHIVE_ZIP ||
-                   result.source_type == FileType::ARCHIVE_RAR ||
-                   result.source_type == FileType::ARCHIVE_7Z) {
-            // Source is an archive, target is a directory, perform decompression
-            if (result.target_type == FileType::DIRECTORY) {
-                result.operation = OperationType::DECOMPRESS;
+        } else { 
+            result.operation = OperationType::DECOMPRESS;
+            if (target_path_str.empty()) {
+                 error::throw_error(error::ErrorCode::MISSING_ARGS, {{"ADDITIONAL_INFO", "Target directory required for decompression."}});
+            }
+            if (fs::exists(target_path_str) && !fs::is_directory(target_path_str)) {
+                error::throw_error(error::ErrorCode::INVALID_TARGET, {{"PATH", target_path_str}, {"REASON", "Target for decompression must be a directory."}});
             }
         }
         
-        // If operation type cannot be determined, throw an error
         if (result.operation == OperationType::UNKNOWN) {
             error::throw_error(error::ErrorCode::UNKNOWN_FORMAT);
         }
         
         return result;
     }
-    
-    // Get string representation of file type
+
     std::string get_file_type_string(FileType type) {
         switch (type) {
             case FileType::REGULAR_FILE: return "Regular File";
@@ -463,8 +402,6 @@ namespace file_type {
             default: return "Unknown Type";
         }
     }
-    
-    // Get string representation of operation type
     std::string get_operation_type_string(OperationType type) {
         switch (type) {
             case OperationType::COMPRESS: return "Compress";
@@ -485,18 +422,19 @@ namespace progress {
         ProgressBar(int width = 50) : width_(width), last_percent_(-1) {}
         
         void update(int percent) {
-            if (percent == last_percent_) {
+            if (percent == last_percent_ && percent != 0 && percent != 100) { 
                 return;
             }
             
             last_percent_ = percent;
+            percent = std::max(0, std::min(100, percent)); 
             
             int pos = width_ * percent / 100;
             
             std::cout << "\r" << i18n::get("progress") << "[";
             for (int i = 0; i < width_; ++i) {
                 if (i < pos) std::cout << "=";
-                else if (i == pos) std::cout << ">";
+                else if (i == pos && percent != 100) std::cout << ">";
                 else std::cout << " ";
             }
             std::cout << "] " << percent << "%" << std::flush;
@@ -507,401 +445,456 @@ namespace progress {
         }
         
         void set_processing_file(const std::string& filename) {
-            std::cout << "\r" << i18n::get("processing_file") << filename << std::endl;
+            std::cout << "\r" << std::string(width_ + 10 + i18n::get("progress").length() + 5, ' ') << "\r"; 
+            std::cout << i18n::get("processing_file") << filename << std::endl;
+            if (last_percent_ != -1 && last_percent_ < 100) { 
+                update(last_percent_);
+            }
         }
     };
 }
 
 // Compression/decompression dispatch module
 namespace operation {
-    // Check if tool is available
     bool is_tool_available(const std::string& tool) {
-        std::string command = "which " + tool + " > /dev/null 2>&1";
+        #ifdef _WIN32
+            std::string command = "where " + tool + " > nul 2>&1";
+        #else
+            std::string command = "which " + tool + " > /dev/null 2>&1";
+        #endif
         return system(command.c_str()) == 0;
     }
     
-    // Execute command and capture output
-    int execute_command(const std::string& command, progress::ProgressBar& progress_bar) {
-        std::array<char, 128> buffer;
-        std::string result_line;
+    int execute_command(const std::string& command_str, progress::ProgressBar& progress_bar) {
+        std::array<char, 256> buffer; 
+        std::string current_line;
         
-        // Create pipe
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(command.c_str(), "r"), pclose);
+        progress_bar.update(0); 
+
+        FILE* pipe = POPEN(command_str.c_str(), "r");
         if (!pipe) {
-            error::throw_error(error::ErrorCode::OPERATION_FAILED, command);
+            error::throw_error(error::ErrorCode::OPERATION_FAILED, {{"COMMAND", command_str}, {"EXIT_CODE", "pipe_failed"}});
+        }
+        std::unique_ptr<FILE, decltype(&PCLOSE)> pipe_closer(pipe, PCLOSE);
+
+        int line_count = 0; 
+        while (fgets(buffer.data(), buffer.size(), pipe_closer.get()) != nullptr) {
+            current_line = buffer.data();
+            line_count++;
+            int percent = std::min(99, (line_count * 5) % 100); 
+            progress_bar.update(percent);
+
+            // Simple check for filenames - can be noisy
+            // if (current_line.find('/') != std::string::npos || current_line.find('\\') != std::string::npos) {
+            //      if (current_line.length() > 2 && (std::isalpha(static_cast<unsigned char>(current_line[0])) && current_line[1] == ':')) { 
+            //          // progress_bar.set_processing_file(current_line); 
+            //      } else if (current_line.find_first_not_of(" \t\n\r") != std::string::npos && current_line.length() < 80) { 
+            //          // progress_bar.set_processing_file(current_line); 
+            //      }
+            // }
         }
         
-        // Read output
-        int line_count = 0;
-        while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-            result_line = buffer.data();
-            
-            // Update progress (this is just a simple simulation, actual progress parsing depends on tool output format)
-            line_count++;
-            int percent = std::min(99, line_count % 100);
-            progress_bar.update(percent);
-            
-            // If output contains a filename, display the file being processed
-            if (result_line.find('/') != std::string::npos) {
-                progress_bar.set_processing_file(result_line);
+        int exit_status = PCLOSE(pipe_closer.release());
+        int actual_exit_code = 0;
+        #ifndef _WIN32 
+        if (WIFEXITED(exit_status)) {
+            actual_exit_code = WEXITSTATUS(exit_status);
+        } else {
+            actual_exit_code = -1; 
+        }
+        #else 
+        actual_exit_code = exit_status;
+        #endif
+
+
+        if (actual_exit_code == 0) {
+            progress_bar.update(100);
+        } else {
+            std::cerr << std::endl; 
+        }
+        return actual_exit_code;
+    }
+
+    std::string get_archivable_item_name(const std::string& raw_path_str) {
+        if (raw_path_str.empty()) return ".";
+
+        fs::path p_orig(raw_path_str);
+        std::string s_normalized = p_orig.string();
+
+        if (s_normalized.length() > 0 && s_normalized.back() == fs::path::preferred_separator) {
+            if (s_normalized != p_orig.root_path().string() && s_normalized != "." && s_normalized != "./" && s_normalized != ".\\") {
+                if (s_normalized.length() > 1 || (s_normalized.length() == 1 && s_normalized[0] != fs::path::preferred_separator)) {
+                    s_normalized.pop_back();
+                }
             }
         }
-        
-        // Complete
-        progress_bar.update(100);
-        
-        return WEXITSTATUS(pclose(pipe.release()));
+        if (raw_path_str == "./" || raw_path_str == ".\\") {
+            s_normalized = ".";
+        }
+
+
+        fs::path p_final(s_normalized);
+        std::string filename = p_final.filename().string();
+
+        if (filename.empty()) {
+            if (p_final.string() == ".") return ".";
+            if (p_final.has_root_name() && !p_final.has_root_directory() && p_final.parent_path().empty()) {
+                return p_final.string(); 
+            }
+            if (p_final.is_absolute() && p_final.root_directory().string() == p_final.string()) { 
+                return p_final.string();
+            }
+            return "."; 
+        }
+        return filename;
     }
-    
-    // Compression operation
-    void compress(const std::string& source_path, const std::string& target_path, file_type::FileType target_type) {
-        std::string command;
+
+    std::string get_archivable_base_dir(const std::string& raw_path_str) {
+        if (raw_path_str.empty()) return ".";
+
+        fs::path p_orig(raw_path_str);
+        std::string s_normalized = p_orig.string();
+
+        if (s_normalized.length() > 0 && s_normalized.back() == fs::path::preferred_separator) {
+            if (s_normalized != p_orig.root_path().string()) { // Don't strip from "/" or "C:\"
+                if (s_normalized.length() > 1 || (s_normalized.length() == 1 && s_normalized[0] != fs::path::preferred_separator) ) {
+                    s_normalized.pop_back();
+                }
+            }
+        }
+         if (raw_path_str == "./" || raw_path_str == ".\\") {
+            s_normalized = ".";
+        }
+
+
+        fs::path p_for_parent_calc(s_normalized);
+        fs::path parent = p_for_parent_calc.parent_path();
+
+        if (parent.empty()) {
+            return ".";
+        }
+        // For absolute root like "/", parent_path is "/". For "C:\", parent_path is "C:\".
+        // So parent.string() is correct.
+        return parent.string();
+    }
+
+    void compress(const std::string& source_path, const std::string& target_path, file_type::FileType target_format_hint) {
+        std::string command_str;
         std::string tool;
+
+        bool source_is_dir = false;
+        if (fs::exists(source_path)) { 
+            try {
+                source_is_dir = fs::is_directory(fs::weakly_canonical(fs::path(source_path)));
+            } catch (const fs::filesystem_error& e) {
+                 source_is_dir = fs::is_directory(fs::path(source_path));
+                 std::cerr << "Warning: weakly_canonical failed for source path '" << source_path << "': " << e.what() << ". Falling back to direct check." << std::endl;
+            }
+        } else {
+            error::throw_error(error::ErrorCode::INVALID_SOURCE, {{"PATH", source_path}});
+        }
+
+        std::string item_to_archive = get_archivable_item_name(source_path);
+        std::string base_dir_for_cmd = get_archivable_base_dir(source_path);
         
-        // Select compression tool and command based on target type
-        switch (target_type) {
+        // Safeguard: if item_to_archive is empty but source_path wasn't, re-evaluate or default.
+        // This should ideally be covered by get_archivable_item_name.
+        if (item_to_archive.empty() && !source_path.empty()) {
+            item_to_archive = fs::path(source_path).filename().string(); // Fallback
+            if (item_to_archive.empty()) item_to_archive = ".";
+        }
+
+
+        switch (target_format_hint) {
             case file_type::FileType::ARCHIVE_TAR:
                 tool = "tar";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "tar -cf \"" + target_path + "\" -C \"" + fs::path(source_path).parent_path().string() + "\" \"" + fs::path(source_path).filename().string() + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = tool + " -cf \"" + target_path + "\" -C \"" + base_dir_for_cmd + "\" \"" + item_to_archive + "\"";
                 break;
-                
             case file_type::FileType::ARCHIVE_TAR_GZ:
                 tool = "tar";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "tar -czf \"" + target_path + "\" -C \"" + fs::path(source_path).parent_path().string() + "\" \"" + fs::path(source_path).filename().string() + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = tool + " -czf \"" + target_path + "\" -C \"" + base_dir_for_cmd + "\" \"" + item_to_archive + "\"";
                 break;
-                
             case file_type::FileType::ARCHIVE_TAR_BZ2:
                 tool = "tar";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "tar -cjf \"" + target_path + "\" -C \"" + fs::path(source_path).parent_path().string() + "\" \"" + fs::path(source_path).filename().string() + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = tool + " -cjf \"" + target_path + "\" -C \"" + base_dir_for_cmd + "\" \"" + item_to_archive + "\"";
                 break;
-                
             case file_type::FileType::ARCHIVE_TAR_XZ:
                 tool = "tar";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "tar -cJf \"" + target_path + "\" -C \"" + fs::path(source_path).parent_path().string() + "\" \"" + fs::path(source_path).filename().string() + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = tool + " -cJf \"" + target_path + "\" -C \"" + base_dir_for_cmd + "\" \"" + item_to_archive + "\"";
                 break;
-                
             case file_type::FileType::ARCHIVE_ZIP:
                 tool = "zip";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                if (fs::is_directory(source_path)) {
-                    command = "cd \"" + fs::path(source_path).parent_path().string() + "\" && zip -r \"" + fs::absolute(target_path).string() + "\" \"" + fs::path(source_path).filename().string() + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                if (source_is_dir) {
+                    command_str = "cd \"" + base_dir_for_cmd + "\" && " + tool + " -r \"" + fs::absolute(target_path).string() + "\" \"" + item_to_archive + "\"";
                 } else {
-                    command = "cd \"" + fs::path(source_path).parent_path().string() + "\" && zip \"" + fs::absolute(target_path).string() + "\" \"" + fs::path(source_path).filename().string() + "\"";
+                    command_str = "cd \"" + base_dir_for_cmd + "\" && " + tool + " \"" + fs::absolute(target_path).string() + "\" \"" + item_to_archive + "\"";
                 }
                 break;
-                
-            case file_type::FileType::ARCHIVE_RAR:
-                tool = "rar";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "rar a \"" + target_path + "\" \"" + source_path + "\"";
+            case file_type::FileType::ARCHIVE_RAR: // Compression with rar is less common/often proprietary
+                tool = "rar"; 
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool + " (for compression)"}});
+                command_str = "cd \"" + base_dir_for_cmd + "\" && " + tool + " a \"" + fs::absolute(target_path).string() + "\" \"" + item_to_archive + "\"";
                 break;
-                
             case file_type::FileType::ARCHIVE_7Z:
                 tool = "7z";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "7z a \"" + target_path + "\" \"" + source_path + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = "cd \"" + base_dir_for_cmd + "\" && " + tool + " a \"" + fs::absolute(target_path).string() + "\" \"" + item_to_archive + "\"";
                 break;
-                
             default:
-                error::throw_error(error::ErrorCode::UNKNOWN_FORMAT);
+                error::throw_error(error::ErrorCode::UNKNOWN_FORMAT, {{"INFO", "Unsupported target format for compression."}});
         }
         
-        // Display compression info
         std::cout << i18n::get("compressing") << std::endl;
-        
-        // Create progress bar
         progress::ProgressBar progress_bar;
-        
-        // Execute command
-        int result = execute_command(command, progress_bar);
-        
-        // Check result
+        int result = execute_command(command_str, progress_bar);
         if (result != 0) {
-            error::throw_error(error::ErrorCode::OPERATION_FAILED, std::to_string(result));
+            error::throw_error(error::ErrorCode::OPERATION_FAILED, {{"COMMAND", command_str}, {"EXIT_CODE", std::to_string(result)}});
         }
-        
         std::cout << i18n::get("operation_complete") << std::endl;
     }
     
-    // Decompression operation
-    void decompress(const std::string& source_path, const std::string& target_path, file_type::FileType source_type) {
-        std::string command;
+    void decompress(const std::string& source_path, const std::string& target_dir_path, file_type::FileType source_archive_type) {
+        std::string command_str;
         std::string tool;
-        
-        // Create target directory (if it doesn't exist)
-        if (!fs::exists(target_path)) {
-            fs::create_directories(target_path);
+
+        if (!fs::exists(target_dir_path)) {
+            try {
+                fs::create_directories(target_dir_path);
+            } catch (const fs::filesystem_error& e) {
+                error::throw_error(error::ErrorCode::INVALID_TARGET, {{"PATH", target_dir_path}, {"REASON", std::string("Failed to create: ") + e.what()}});
+            }
+        } else if (!fs::is_directory(target_dir_path)) {
+             error::throw_error(error::ErrorCode::INVALID_TARGET, {{"PATH", target_dir_path}, {"REASON", "Target exists but is not a directory."}});
         }
-        
-        // Select decompression tool and command based on source type
-        switch (source_type) {
+
+        switch (source_archive_type) {
             case file_type::FileType::ARCHIVE_TAR:
                 tool = "tar";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "tar -xf \"" + source_path + "\" -C \"" + target_path + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = tool + " -xf \"" + source_path + "\" -C \"" + target_dir_path + "\"";
                 break;
-                
             case file_type::FileType::ARCHIVE_TAR_GZ:
                 tool = "tar";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "tar -xzf \"" + source_path + "\" -C \"" + target_path + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = tool + " -xzf \"" + source_path + "\" -C \"" + target_dir_path + "\"";
                 break;
-                
             case file_type::FileType::ARCHIVE_TAR_BZ2:
                 tool = "tar";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "tar -xjf \"" + source_path + "\" -C \"" + target_path + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = tool + " -xjf \"" + source_path + "\" -C \"" + target_dir_path + "\"";
                 break;
-                
             case file_type::FileType::ARCHIVE_TAR_XZ:
                 tool = "tar";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "tar -xJf \"" + source_path + "\" -C \"" + target_path + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = tool + " -xJf \"" + source_path + "\" -C \"" + target_dir_path + "\"";
                 break;
-                
             case file_type::FileType::ARCHIVE_ZIP:
                 tool = "unzip";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "unzip \"" + source_path + "\" -d \"" + target_path + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = tool + " -o \"" + source_path + "\" -d \"" + target_dir_path + "\""; 
                 break;
-                
             case file_type::FileType::ARCHIVE_RAR:
-                tool = "unrar";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
+                tool = "unrar"; 
+                if (!is_tool_available(tool)) { 
+                    tool = "rar"; // Try rar x
+                    if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", "unrar or rar e/x"}});
+                    command_str = tool + " x -o+ \"" + source_path + "\" \"" + fs::path(target_dir_path).string() + fs::path::preferred_separator + "\""; 
+                } else {
+                     command_str = tool + " x -o+ \"" + source_path + "\" \"" + fs::path(target_dir_path).string() + fs::path::preferred_separator + "\""; 
                 }
-                command = "unrar x \"" + source_path + "\" \"" + target_path + "\"";
                 break;
-                
             case file_type::FileType::ARCHIVE_7Z:
                 tool = "7z";
-                if (!is_tool_available(tool)) {
-                    error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, tool);
-                }
-                command = "7z x \"" + source_path + "\" -o\"" + target_path + "\"";
+                if (!is_tool_available(tool)) error::throw_error(error::ErrorCode::TOOL_NOT_FOUND, {{"TOOL_NAME", tool}});
+                command_str = tool + " x \"" + source_path + "\" -o\"" + target_dir_path + "\" -y"; 
                 break;
-                
             default:
-                error::throw_error(error::ErrorCode::UNKNOWN_FORMAT);
+                error::throw_error(error::ErrorCode::UNKNOWN_FORMAT, {{"INFO", "Unsupported source format for decompression."}});
         }
         
-        // Display decompression info
         std::cout << i18n::get("decompressing") << std::endl;
-        
-        // Create progress bar
         progress::ProgressBar progress_bar;
-        
-        // Execute command
-        int result = execute_command(command, progress_bar);
-        
-        // Check result
+        int result = execute_command(command_str, progress_bar);
         if (result != 0) {
-            error::throw_error(error::ErrorCode::OPERATION_FAILED, std::to_string(result));
+            error::throw_error(error::ErrorCode::OPERATION_FAILED, {{"COMMAND", command_str}, {"EXIT_CODE", std::to_string(result)}});
         }
-        
         std::cout << i18n::get("operation_complete") << std::endl;
     }
 }
 
 // Interactive mode module
 namespace interactive {
-    // Get user input
     std::string get_input() {
         std::string input;
         std::getline(std::cin, input);
+        input.erase(0, input.find_first_not_of(" \t\n\r"));
+        input.erase(input.find_last_not_of(" \t\n\r") + 1);
         return input;
     }
     
-    // Get user choice (number)
-    int get_choice(int min, int max) {
+    int get_choice(int min_val, int max_val) { 
         while (true) {
+            std::cout << "> ";
             std::string input = get_input();
             try {
                 int choice = std::stoi(input);
-                if (choice >= min && choice <= max) {
+                if (choice >= min_val && choice <= max_val) {
                     return choice;
                 }
-            } catch (...) {
-                // Ignore conversion errors
+            } catch (const std::invalid_argument&) {
+            } catch (const std::out_of_range&) {
             }
             std::cout << i18n::get("invalid_choice") << std::endl;
         }
     }
     
-    // Get user confirmation (y/n)
-    bool get_confirmation() {
+    bool get_confirmation(const std::string& prompt_key, const std::map<std::string, std::string>& placeholders = {}) {
+        std::cout << i18n::get(prompt_key, placeholders);
         while (true) {
             std::string input = get_input();
-            if (input == "y" || input == "Y") {
-                return true;
-            } else if (input == "n" || input == "N") {
-                return false;
+            if (!input.empty()) {
+                char choice = static_cast<char>(std::tolower(static_cast<unsigned char>(input[0])));
+                if (choice == 'y') return true;
+                if (choice == 'n') return false;
             }
-            std::cout << i18n::get("invalid_choice") << std::endl;
+            std::cout << i18n::get("invalid_choice") << " (y/n): ";
         }
     }
     
-    // Interactive operation
-    void run(const std::string& source_path) {
+    void run(std::string& source_path_ref) { 
         std::cout << i18n::get("interactive_mode") << std::endl;
         
-        // Check if source path exists
-        if (!fs::exists(source_path)) {
-            error::throw_error(error::ErrorCode::INVALID_SOURCE);
+        if (source_path_ref.empty()) {
+            std::cout << "Please enter source path: ";
+            source_path_ref = get_input();
+             if (source_path_ref.empty()) {
+                std::cerr << "Source path cannot be empty." << std::endl;
+                return;
+            }
+        }
+
+        if (!fs::exists(source_path_ref)) {
+            error::throw_error(error::ErrorCode::INVALID_SOURCE, {{"PATH", source_path_ref}});
         }
         
-        // Determine source file type
-        file_type::FileType source_type;
-        if (fs::is_directory(source_path)) {
-            source_type = file_type::FileType::DIRECTORY;
-        } else if (fs::is_regular_file(source_path)) {
-            // First try to recognize by extension
-            source_type = file_type::recognize_by_extension(source_path);
-            
-            // If not recognized by extension, try to recognize by file header
-            if (source_type == file_type::FileType::UNKNOWN) {
-                source_type = file_type::recognize_by_header(source_path);
+        file_type::FileType current_source_type;
+        if (fs::is_directory(source_path_ref)) {
+            current_source_type = file_type::FileType::DIRECTORY;
+        } else if (fs::is_regular_file(source_path_ref)) {
+            current_source_type = file_type::recognize_by_extension(source_path_ref);
+            if (current_source_type == file_type::FileType::UNKNOWN) {
+                current_source_type = file_type::recognize_by_header(source_path_ref);
             }
-            
-            // If still unrecognized, treat as regular file
-            if (source_type == file_type::FileType::UNKNOWN) {
-                source_type = file_type::FileType::REGULAR_FILE;
+            if (current_source_type == file_type::FileType::UNKNOWN) {
+                current_source_type = file_type::FileType::REGULAR_FILE;
             }
         } else {
-            error::throw_error(error::ErrorCode::INVALID_SOURCE);
+            error::throw_error(error::ErrorCode::INVALID_SOURCE, {{"PATH", source_path_ref}, {"REASON", "Not a file or directory"}});
         }
         
-        // Display source file type
-        std::cout << "Source file type: " << file_type::get_file_type_string(source_type) << std::endl;
+        std::cout << "Source: " << source_path_ref << " (" << file_type::get_file_type_string(current_source_type) << ")" << std::endl;
         
-        // Determine operation type
-        file_type::OperationType operation_type;
-        if (source_type == file_type::FileType::DIRECTORY || source_type == file_type::FileType::REGULAR_FILE) {
-            // Source is a directory or regular file, default to compression
-            operation_type = file_type::OperationType::COMPRESS;
+        file_type::OperationType op_type;
+        if (current_source_type == file_type::FileType::DIRECTORY || current_source_type == file_type::FileType::REGULAR_FILE) {
+            op_type = file_type::OperationType::COMPRESS;
+            std::cout << "Defaulting to Compress operation." << std::endl;
         } else {
-            // Source is an archive file, default to decompression
-            operation_type = file_type::OperationType::DECOMPRESS;
+            op_type = file_type::OperationType::DECOMPRESS;
+            std::cout << "Defaulting to Decompress operation." << std::endl;
         }
         
-        // Ask for operation type
         std::cout << i18n::get("ask_operation") << std::endl;
         std::cout << i18n::get("operation_compress") << std::endl;
         std::cout << i18n::get("operation_decompress") << std::endl;
-        int choice = get_choice(1, 2);
-        operation_type = (choice == 1) ? file_type::OperationType::COMPRESS : file_type::OperationType::DECOMPRESS;
+        int op_choice = get_choice(1, 2);
+        op_type = (op_choice == 1) ? file_type::OperationType::COMPRESS : file_type::OperationType::DECOMPRESS;
         
-        // If it's a compression operation, ask for compression format
-        file_type::FileType target_type = file_type::FileType::UNKNOWN;
-        if (operation_type == file_type::OperationType::COMPRESS) {
+        file_type::FileType target_archive_format = file_type::FileType::UNKNOWN;
+        std::string target_path_str;
+
+        if (op_type == file_type::OperationType::COMPRESS) {
             std::cout << i18n::get("ask_format") << std::endl;
+            std::cout << i18n::get("format_tar_gz") << std::endl; // Default to tar.gz as #1
+            std::cout << i18n::get("format_zip") << std::endl;
             std::cout << i18n::get("format_tar") << std::endl;
-            std::cout << i18n::get("format_tar_gz") << std::endl;
             std::cout << i18n::get("format_tar_bz2") << std::endl;
             std::cout << i18n::get("format_tar_xz") << std::endl;
-            std::cout << i18n::get("format_zip") << std::endl;
             std::cout << i18n::get("format_7z") << std::endl;
-            std::cout << i18n::get("format_rar") << std::endl;
-            
-            choice = get_choice(1, 7);
-            switch (choice) {
-                case 1: target_type = file_type::FileType::ARCHIVE_TAR; break;
-                case 2: target_type = file_type::FileType::ARCHIVE_TAR_GZ; break;
-                case 3: target_type = file_type::FileType::ARCHIVE_TAR_BZ2; break;
-                case 4: target_type = file_type::FileType::ARCHIVE_TAR_XZ; break;
-                case 5: target_type = file_type::FileType::ARCHIVE_ZIP; break;
-                case 6: target_type = file_type::FileType::ARCHIVE_7Z; break;
-                case 7: target_type = file_type::FileType::ARCHIVE_RAR; break;
+            // RAR compression is often not available or desired for creation
+            int format_choice = get_choice(1, 6); 
+            switch (format_choice) {
+                case 1: target_archive_format = file_type::FileType::ARCHIVE_TAR_GZ; break;
+                case 2: target_archive_format = file_type::FileType::ARCHIVE_ZIP; break;
+                case 3: target_archive_format = file_type::FileType::ARCHIVE_TAR; break;
+                case 4: target_archive_format = file_type::FileType::ARCHIVE_TAR_BZ2; break;
+                case 5: target_archive_format = file_type::FileType::ARCHIVE_TAR_XZ; break;
+                case 6: target_archive_format = file_type::FileType::ARCHIVE_7Z; break;
             }
-        }
-        
-        // Ask for target path
-        std::string target_path;
-        std::cout << "Please enter target path: ";
-        target_path = get_input();
-        
-        // If target path is empty, use default path
-        if (target_path.empty()) {
-            if (operation_type == file_type::OperationType::COMPRESS) {
-                // Default to compressing to current directory, using source filename with appropriate extension
+            
+            std::cout << "Please enter target archive name/path (e.g., archive.zip or /path/to/archive.tar.gz): ";
+            target_path_str = get_input();
+            if (target_path_str.empty()) {
                 std::string ext;
-                switch (target_type) {
+                switch (target_archive_format) {
                     case file_type::FileType::ARCHIVE_TAR: ext = ".tar"; break;
                     case file_type::FileType::ARCHIVE_TAR_GZ: ext = ".tar.gz"; break;
                     case file_type::FileType::ARCHIVE_TAR_BZ2: ext = ".tar.bz2"; break;
                     case file_type::FileType::ARCHIVE_TAR_XZ: ext = ".tar.xz"; break;
                     case file_type::FileType::ARCHIVE_ZIP: ext = ".zip"; break;
                     case file_type::FileType::ARCHIVE_7Z: ext = ".7z"; break;
-                    case file_type::FileType::ARCHIVE_RAR: ext = ".rar"; break;
-                    default: ext = ".unknown";
+                    default: ext = ".archive"; // Should not happen with validated choice
                 }
-                target_path = fs::path(source_path).filename().string() + ext;
-            } else {
-                // Default to decompressing to current directory
-                target_path = ".";
+                target_path_str = fs::path(source_path_ref).stem().string() + ext;
+                std::cout << "Defaulting target to: " << target_path_str << std::endl;
+            }
+        } else { // Decompress
+            std::cout << "Please enter target directory for extraction (default: current directory './'): ";
+            target_path_str = get_input();
+            if (target_path_str.empty()) {
+                target_path_str = ".";
+            }
+        }
+
+        if (fs::exists(target_path_str)) {
+            if (op_type == file_type::OperationType::COMPRESS || 
+               (op_type == file_type::OperationType::DECOMPRESS && !fs::is_directory(target_path_str))) { 
+                if (!get_confirmation("ask_overwrite", {{"TARGET_PATH", target_path_str}})) {
+                    std::cout << i18n::get("operation_canceled") << std::endl;
+                    return;
+                }
             }
         }
         
-        // Check if target path exists
-        if (fs::exists(target_path)) {
-            std::cout << i18n::get("ask_overwrite");
-            if (!get_confirmation()) {
-                std::cout << i18n::get("operation_canceled") << std::endl;
-                return;
-            }
-        }
+        bool delete_source = get_confirmation("ask_delete_source", {{"SOURCE_PATH", source_path_ref}});
         
-        // Ask whether to delete source file
-        bool delete_source = false;
-        std::cout << i18n::get("ask_delete_source");
-        delete_source = get_confirmation();
-        
-        // Perform operation
         try {
-            if (operation_type == file_type::OperationType::COMPRESS) {
-                operation::compress(source_path, target_path, target_type);
-            } else {
-                operation::decompress(source_path, target_path, source_type);
+            if (op_type == file_type::OperationType::COMPRESS) {
+                operation::compress(source_path_ref, target_path_str, target_archive_format);
+            } else { 
+                operation::decompress(source_path_ref, target_path_str, current_source_type);
             }
             
-            // If source file needs to be deleted
             if (delete_source) {
-                if (fs::is_directory(source_path)) {
-                    fs::remove_all(source_path);
+                std::cout << "Deleting source: " << source_path_ref << std::endl;
+                std::error_code ec;
+                if (fs::is_directory(source_path_ref)) {
+                    fs::remove_all(source_path_ref, ec);
                 } else {
-                    fs::remove(source_path);
+                    fs::remove(source_path_ref, ec);
+                }
+                if (ec) {
+                     std::cerr << "Warning: Failed to delete source '" << source_path_ref << "': " << ec.message() << std::endl;
+                } else {
+                     std::cout << "Source deleted." << std::endl;
                 }
             }
         } catch (const error::HitpagException& e) {
-            std::cerr << e.what() << std::endl;
+            std::cerr << e.what() << std::endl; // Already formatted by throw_error
         }
     }
 }
@@ -909,48 +902,57 @@ namespace interactive {
 // Main program
 int main(int argc, char* argv[]) {
     try {
-        // Parse command line arguments
         args::Options options = args::parse(argc, argv);
         
-        // Display help information
         if (options.show_help) {
             args::show_help();
-            return 0;
+            return static_cast<int>(error::ErrorCode::SUCCESS);
         }
-        
-        // Display version information
         if (options.show_version) {
             args::show_version();
-            return 0;
+            return static_cast<int>(error::ErrorCode::SUCCESS);
         }
         
-        // Interactive mode
         if (options.interactive_mode) {
-            interactive::run(options.source_path);
-            return 0;
+            interactive::run(options.source_path); 
+        } else {
+            if (options.source_path.empty()) {
+                 error::throw_error(error::ErrorCode::MISSING_ARGS, {{"ADDITIONAL_INFO", "Source path required in automatic mode."}});
+            }
+            if (options.target_path.empty()){
+                 error::throw_error(error::ErrorCode::MISSING_ARGS, {{"ADDITIONAL_INFO", "Target path required in automatic mode."}});
+            }
+            // Check for same path only if both exist and can be compared
+            if (fs::exists(options.source_path) && fs::exists(options.target_path)) {
+                std::error_code ec;
+                if (fs::equivalent(fs::path(options.source_path), fs::path(options.target_path), ec)) {
+                    if (!ec) error::throw_error(error::ErrorCode::SAME_PATH);
+                    // else: cannot determine equivalence, proceed with caution or warn
+                }
+            }
+
+
+            file_type::RecognitionResult result = file_type::recognize(options.source_path, options.target_path);
+            
+            if (result.operation == file_type::OperationType::COMPRESS) {
+                operation::compress(options.source_path, options.target_path, result.target_type_hint);
+            } else if (result.operation == file_type::OperationType::DECOMPRESS) {
+                operation::decompress(options.source_path, options.target_path, result.source_type);
+            }
         }
         
-        // Automatic mode
-        // Recognize file type and operation type
-        file_type::RecognitionResult result = file_type::recognize(options.source_path, options.target_path);
-        
-        // Perform operation
-        if (result.operation == file_type::OperationType::COMPRESS) {
-            operation::compress(options.source_path, options.target_path, result.target_type);
-        } else if (result.operation == file_type::OperationType::DECOMPRESS) {
-            operation::decompress(options.source_path, options.target_path, result.source_type);
-        }
-        
+        std::cout << i18n::get("goodbye") << std::endl;
+
     } catch (const error::HitpagException& e) {
         std::cerr << e.what() << std::endl;
-        return 1;
+        return static_cast<int>(e.code()); 
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
+        std::cerr << "Standard Exception: " << e.what() << std::endl;
+        return static_cast<int>(error::ErrorCode::UNKNOWN_ERROR);
     } catch (...) {
-        std::cerr << "Unknown error" << std::endl;
-        return 1;
+        std::cerr << "An unknown error occurred." << std::endl;
+        return static_cast<int>(error::ErrorCode::UNKNOWN_ERROR);
     }
     
-    return 0;
+    return static_cast<int>(error::ErrorCode::SUCCESS);
 }
